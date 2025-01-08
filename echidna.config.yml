@@ -1,0 +1,4 @@
+testMode: assertion
+testLimit: 10000
+contractAddr: "0x00a329c0648769A73afAc7F9381E08FB43dBEA72"
+contract: "EchidnaTest"

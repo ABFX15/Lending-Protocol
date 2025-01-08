@@ -3,12 +3,14 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "echidna": "echidna contracts/test/EchidnaTest.sol --config echidna.config.yml --solc-args=\"--allow-paths $(pwd)/node_modules\""
   },
   "author": "",
   "license": "ISC",
   "description": "",
   "devDependencies": {
+    "@crytic/echidna": "^0.0.6",
     "@nomicfoundation/hardhat-ethers": "^3.0.8",
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
     "ethers": "^6.13.5",

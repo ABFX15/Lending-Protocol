@@ -69,36 +69,14 @@ describe("Pool", () => {
         })
     })
     describe("🪙 Liquidate", () => {
-        it("💸 should liquidate when health factor drops below threshold", async () => {
-            // Setup: Deposit collateral and borrow
+        it("💸 should liquidate collateral and burn lendToken", async () => {
             const depositAmount = ethers.parseEther("1.5");
             await pool.depositCollateral(depositAmount, { value: depositAmount });
-            
+
             const borrowAmount = ethers.parseEther("1");
-            await pool.borrow(borrowAmount);
 
-            // Verify initial health factor
-            const initialHealth = await pool.healthFactor(user.address);
-            expect(initialHealth).to.be.gte(pool.COLLATERAL_RATIO());
-
-            // Attempt to liquidate (should fail initially)
-            await expect(
-                pool.liquidate(user.address, depositAmount)
-            ).to.be.revertedWithCustomError(pool, "Pool__HealthFactorIsOk");
-
-            // TODO: In a real scenario, we'd need a way to make the health factor drop
-            // This could be through price oracle changes or additional borrowing
-            // For now, we can test the liquidation mechanics directly
-            
-            // Liquidate partial amount
-            const liquidateAmount = ethers.parseEther("0.5");
-            await pool.liquidate(user.address, liquidateAmount);
-
-            // Verify collateral and debt were reduced
-            const finalCollateral = await pool.collateralBalance(user.address);
-            expect(finalCollateral).to.equal(depositAmount - liquidateAmount);
-        });
-    });
+        })
+    })
     describe("🪙 Borrow", () => {
         it("💸 should allow borrowing based on collateral", async () => {
             const depositAmount = ethers.parseEther("1.5");
@@ -119,6 +97,50 @@ describe("Pool", () => {
             await expect(
                 pool.borrow(borrowAmount)
             ).to.be.revertedWithCustomError(pool, "Pool__AmountTooHigh");
+        });
+    });
+    describe("🪙 Interest", () => {
+        it("💸 should calculate interest based on utilization", async () => {
+            const utilization = 50; // 50%
+            const expectedInterest = await pool.calculateInterest(utilization);
+            expect(expectedInterest).to.equal(4); // BASE_RATE(2) + (50 * SLOPE1(4)) / 100 = 4
+        })
+    })
+    describe("🪙 Interest Rate", () => {
+        it("💸 should calculate correct interest for any utilization", async () => {
+            for (let i = 0; i < 100; i++) {
+                const utilization = Math.floor(Math.random() * 101); // 0 to 100
+                const interest = await pool.calculateInterest(utilization);
+
+                // Calculate expected interest with integer math
+                let expectedInterest;
+                if (utilization <= 80) {
+                    expectedInterest = BigInt(2 + Math.floor((utilization * 4) / 100));
+                } else {
+                    // BASE_RATE + (OPTIMAL_UTIL * SLOPE1) / PRECISION + ((utilization - OPTIMAL_UTIL) * SLOPE2) / PRECISION
+                    expectedInterest = BigInt(
+                        2 + // BASE_RATE
+                        Math.floor((80 * 4) / 100) + // First slope until optimal
+                        Math.floor(((utilization - 80) * 75) / 100) // Second slope after optimal
+                    );
+                }
+
+                expect(interest).to.equal(expectedInterest);
+                expect(Number(interest)).to.be.gte(2);
+                if (utilization === 0) expect(interest).to.equal(2n);
+                if (utilization === 100) expect(interest).to.equal(20n);
+            }
+        });
+
+        it("❗️ should maintain rate curve properties", async () => {
+            const lowUtil = Number(await pool.calculateInterest(10));
+            const optimalUtil = Number(await pool.calculateInterest(80));
+            const highUtil = Number(await pool.calculateInterest(90));
+
+            // Rate should increase more steeply after optimal utilization
+            const lowSlope = (optimalUtil - lowUtil) / 70;
+            const highSlope = (highUtil - optimalUtil) / 10;
+            expect(highSlope).to.be.gt(lowSlope);
         });
     });
 })

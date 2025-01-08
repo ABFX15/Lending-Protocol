@@ -16,6 +16,7 @@ contract Pool is ReentrancyGuard {
     error Pool__NotEnoughTokens();  
     error Pool__AmountTooHigh();
     error Pool__HealthFactorTooLow();
+    error Pool__TransferFailed();
 
     /*//////////////////////////////////////////////////////////////
                                  STATE
@@ -23,7 +24,12 @@ contract Pool is ReentrancyGuard {
     LendToken public immutable i_lendToken;
 
     uint256 public constant COLLATERAL_RATIO = 150; // 150%
-    uint256 public constant PRECISION = 1e18;
+    uint256 public constant PRECISION = 100;
+    uint256 public constant BASE_RATE = 2; // 2%
+    uint256 public constant OPTIMAL_UTILIZATION = 80; // 80%
+    uint256 public constant SLOPE1 = 4; // 80%
+    uint256 public constant SLOPE2 = 75; // 80%
+
 
     mapping(address => uint256) public collateralBalance;
 
@@ -54,14 +60,22 @@ contract Pool is ReentrancyGuard {
         uint256 maxBorrow = (collateralBalance[msg.sender] * PRECISION) / COLLATERAL_RATIO;
         if(amountToBorrow > maxBorrow) revert Pool__AmountTooHigh();
 
-        _mintLendToken(amountToBorrow);
-        
-        // Add check to prevent borrowing that would make position unhealthy
+        // Check health factor before minting
         if(healthFactor(msg.sender) < COLLATERAL_RATIO) {
             revert Pool__HealthFactorTooLow();
         }
-        
+
+        _mintLendToken(amountToBorrow);
         emit LendTokenBorrowed(msg.sender, amountToBorrow);
+    }
+
+    function calculateInterest(uint256 utilization) public pure returns (uint256) {
+        if (utilization <= OPTIMAL_UTILIZATION) {
+            return BASE_RATE + (utilization * SLOPE1) / PRECISION;
+        } else {
+            return BASE_RATE + SLOPE1 * OPTIMAL_UTILIZATION / PRECISION +
+                ((utilization - OPTIMAL_UTILIZATION) * SLOPE2) / PRECISION;
+        }
     }
 
     function withdrawCollateral(uint256 amount) external nonReentrant {
@@ -69,7 +83,10 @@ contract Pool is ReentrancyGuard {
         if(i_lendToken.balanceOf(msg.sender) > 0) revert Pool__HasDebt();
         
         collateralBalance[msg.sender] -= amount;
-        payable(msg.sender).transfer(amount);
+        
+
+        (bool success, ) = msg.sender.call{value: amount}("");
+        if (!success) revert Pool__TransferFailed();
         
         emit CollateralWithdrawn(msg.sender, amount);
     }
@@ -90,8 +107,7 @@ contract Pool is ReentrancyGuard {
                            INTERNAL FUNCTIONS
     //////////////////////////////////////////////////////////////*/
     function _mintLendToken(uint256 amountToMint) internal {
-        uint256 lendTokenAmount = (amountToMint * PRECISION) / COLLATERAL_RATIO;
-        i_lendToken.mint(msg.sender, lendTokenAmount);
+        i_lendToken.mint(msg.sender, amountToMint);
     }
 
     function _burnLendToken(uint256 amountOfCollateral, address user) internal {
