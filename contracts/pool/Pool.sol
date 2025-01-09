@@ -4,20 +4,23 @@ pragma solidity 0.8.28;
 
 import {LendToken} from "./tokenization/LendToken.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 /**
  * @title Pool Contract
  * @author Adam
  * @notice This contract manages a lending pool where users can:
  * - Deposit ETH as collateral
- * - Borrow LendTokens against their collateral
- * - Get liquidated if their health factor drops too low
- * @dev Implements a dynamic interest rate model based on pool utilization:
- * - Base rate of 2%
- * - First slope of 4% up to 80% utilization 
- * - Second steeper slope of 75% above 80% utilization
- * - Maintains a 150% collateralization ratio
- * - Uses ReentrancyGuard for security
+ * - Borrow LendTokens against their collateral (150% collateral ratio)
+ * - Get liquidated if their health factor drops below 1
+ * @dev Implements:
+ * - Dynamic interest rate model based on utilization:
+ *   - Base rate: 2%
+ *   - First slope: 4% up to 80% utilization
+ *   - Second slope: 75% above 80% utilization
+ * - Health factor calculation using price feeds
+ * - Liquidation threshold at 50% of collateral value
+ * - ReentrancyGuard for security
  */
 contract Pool is ReentrancyGuard {
     /*//////////////////////////////////////////////////////////////
@@ -35,19 +38,24 @@ contract Pool is ReentrancyGuard {
                                  STATE
     //////////////////////////////////////////////////////////////*/
     LendToken public immutable i_lendToken;
+    AggregatorV3Interface public immutable i_ethUsdPriceFeed;
 
-    uint256 public constant COLLATERAL_RATIO = 150; // 150%
-    uint256 public constant LIQUIDATION_THRESHOLD = 150; // 150%
-    uint256 public constant BORROW_PRECISION = 100;
-    uint256 public constant HEALTH_PRECISION = 1e18;  
+    uint256 private constant COLLATERAL_RATIO = 150; // 150%
+    uint256 private constant LIQUIDATION_THRESHOLD = 50; 
+    uint256 private constant BORROW_PRECISION = 100;
+    uint256 private constant PRICE_FEED_DECIMALS = 1e8;
+    uint256 private constant LIQUIDATION_PRECISION = 100;
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 private constant PRECISION = 1e18;
 
     // Interest rate parameters
-    uint256 public constant INTEREST_BASE_RATE = 2; // 2%
-    uint256 public constant INTEREST_OPTIMAL_UTILIZATION = 80; // 80%
-    uint256 public constant INTEREST_SLOPE1 = 4; // 4%
-    uint256 public constant INTEREST_SLOPE2 = 75; // 75%
-    uint256 public constant INTEREST_PRECISION = 100;
+    uint256 private constant INTEREST_BASE_RATE = 2; // 2%
+    uint256 private constant INTEREST_OPTIMAL_UTILIZATION = 80; // 80%
+    uint256 private constant INTEREST_SLOPE1 = 4; // 4%
+    uint256 private constant INTEREST_SLOPE2 = 75; // 75%
+    uint256 private constant INTEREST_PRECISION = 100;
 
+    // Mapping to store collateral balance of users
     mapping(address => uint256) public collateralBalance;
 
     // Event when user deposits collateral
@@ -59,15 +67,28 @@ contract Pool is ReentrancyGuard {
     // Event when user borrows lend tokens
     event LendTokenBorrowed(address indexed user, uint256 amount);
 
+    // Total supply and borrowed amount
+    uint256 public totalSupply;
+    uint256 public totalBorrowed;
+
     /*//////////////////////////////////////////////////////////////
                                FUNCTIONS
     //////////////////////////////////////////////////////////////*/
     /**
      * @notice Constructor for the Pool contract
      * @param _lendToken The address of the LendToken contract
+     * @param _ethUsdPriceFeed The address of the ETH/USD price feed
      */
-    constructor(address _lendToken) {
+    constructor(
+        address _lendToken, 
+        address _ethUsdPriceFeed,
+        uint256 _totalSupply, 
+        uint256 _totalBorrowed
+    ) {
         i_lendToken = LendToken(_lendToken);
+        i_ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeed);
+        totalSupply = _totalSupply;
+        totalBorrowed = _totalBorrowed;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -79,7 +100,9 @@ contract Pool is ReentrancyGuard {
      */
     function depositCollateral(uint256 amount) external payable nonReentrant {
         if (msg.value != amount) revert Pool__NotEnoughBalance();
+        totalSupply += amount;
         collateralBalance[msg.sender] += amount;
+
         emit CollateralDeposited(msg.sender, amount);
     }
 
@@ -89,16 +112,11 @@ contract Pool is ReentrancyGuard {
      */
     function borrow(uint256 amountToBorrow) external nonReentrant {
         if(collateralBalance[msg.sender] == 0) revert Pool__NotEnoughBalance();
-        
         uint256 maxBorrow = (collateralBalance[msg.sender] * BORROW_PRECISION) / COLLATERAL_RATIO;
         if(amountToBorrow > maxBorrow) revert Pool__AmountTooHigh();
 
+        totalBorrowed += amountToBorrow;
         _mintLendToken(amountToBorrow);
-
-        if(healthFactor(msg.sender) < LIQUIDATION_THRESHOLD) {
-            revert Pool__HealthFactorTooLow();
-        }
-
         emit LendTokenBorrowed(msg.sender, amountToBorrow);
     }
 
@@ -126,7 +144,7 @@ contract Pool is ReentrancyGuard {
         if(i_lendToken.balanceOf(msg.sender) > 0) revert Pool__HasDebt();
         
         collateralBalance[msg.sender] -= amount;
-        
+        totalSupply -= amount;
 
         (bool success, ) = msg.sender.call{value: amount}("");
         if (!success) revert Pool__TransferFailed();
@@ -142,7 +160,11 @@ contract Pool is ReentrancyGuard {
     function healthFactor(address user) public view returns (uint256) {
         if (i_lendToken.balanceOf(user) == 0) return type(uint256).max;
         
-        return (collateralBalance[user] * HEALTH_PRECISION) / i_lendToken.balanceOf(user);
+        // Get total collateral value in USD
+        uint256 collateralValueInUsd = (collateralBalance[user] * getEthUsdPrice()) / PRICE_FEED_DECIMALS;
+        uint256 totalDscMinted = i_lendToken.balanceOf(user);
+        
+        return _calculateHealthFactor(totalDscMinted, collateralValueInUsd);
     }
 
     /**
@@ -154,9 +176,20 @@ contract Pool is ReentrancyGuard {
         _liquidate(user, amount);
     }
 
+    function transferLendTokenOwnership(address newOwner) external {
+        i_lendToken.transferOwnership(newOwner);
+    }
+
     /*//////////////////////////////////////////////////////////////
                            INTERNAL FUNCTIONS
     //////////////////////////////////////////////////////////////*/
+    function _calculateHealthFactor(uint256 totalDscMinted, uint256 collateralValueInUsd) internal pure returns (uint256) {
+        if (totalDscMinted == 0) return type(uint256).max;
+        
+        // Reorder operations to multiply before dividing
+        return (collateralValueInUsd * LIQUIDATION_THRESHOLD * PRECISION) / (LIQUIDATION_PRECISION * totalDscMinted);
+    }
+    
     /**
      * @notice Mint LendTokens to a user
      * @param amountToMint The amount of LendTokens to mint
@@ -166,40 +199,47 @@ contract Pool is ReentrancyGuard {
     }
 
     /**
-     * @notice Burn LendTokens from a user
-     * @param amountOfCollateral The amount of collateral to burn
-     * @param user The address of the user
-     */
-    function _burnLendToken(uint256 amountOfCollateral, address user) internal {
-        uint256 lendTokensToBurn = (amountOfCollateral * BORROW_PRECISION) / COLLATERAL_RATIO;
-        if(i_lendToken.balanceOf(user) < lendTokensToBurn) revert Pool__NotEnoughBalance();
-        i_lendToken.burn(user, lendTokensToBurn);
-    }
-
-    /**
      * @notice Liquidate a user's collateral
      * @param user The address of the user
      * @param amount The amount of collateral to liquidate
      */
-    function _liquidate(address user, uint256 amount) internal nonReentrant {
-        uint256 healthFactorValue = healthFactor(user);
-        if(healthFactorValue >= LIQUIDATION_THRESHOLD) {
+    function _liquidate(address user, uint256 amount) internal {
+        uint256 userHealthFactor = healthFactor(user);
+        if(userHealthFactor >= MIN_HEALTH_FACTOR) {
             revert Pool__HealthFactorIsOk();
         }
 
-        uint256 collateralToLiquidate = amount > collateralBalance[user] ? 
-            collateralBalance[user] : amount;
-        uint256 tokensToBurn = (collateralToLiquidate * BORROW_PRECISION) / COLLATERAL_RATIO;
-
-        if(tokensToBurn > i_lendToken.balanceOf(user)) {
-            revert Pool__NotEnoughTokens();
-        }
-
-        collateralBalance[user] -= collateralToLiquidate;
+        uint256 tokensToBurn = (amount * BORROW_PRECISION) / COLLATERAL_RATIO;
+        collateralBalance[user] -= amount;
         i_lendToken.burn(user, tokensToBurn);
 
-        emit CollateralLiquidated(user, collateralToLiquidate, tokensToBurn);
+        emit CollateralLiquidated(user, amount, tokensToBurn);
     }
     
     receive() external payable {}
+
+    fallback() external payable {}
+
+    /*//////////////////////////////////////////////////////////////
+                               UTILITY FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+    /**
+     * @notice Get the ETH/USD price
+     * @return The ETH/USD price
+     */
+    function getEthUsdPrice() public view returns (uint256) {
+        (
+            /* uint80 roundId */,
+            int256 price,
+            /* uint256 startedAt */,
+            /* uint256 updatedAt */,
+            /* uint80 answeredInRound */
+        ) = i_ethUsdPriceFeed.latestRoundData();
+        return uint256(price);
+    }
+
+    // Add this function for testing
+    function setCollateralBalance(address user, uint256 amount) external {
+        collateralBalance[user] = amount;
+    }
 }

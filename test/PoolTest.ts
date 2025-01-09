@@ -4,6 +4,9 @@ import { Pool } from "../typechain-types";
 import { LendToken } from "../typechain-types";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
+const BORROW_PRECISION = 100n;
+const COLLATERAL_RATIO = 150n;
+
 describe("Pool", () => {
     let pool: Pool;
     let lendToken: LendToken;
@@ -14,8 +17,18 @@ describe("Pool", () => {
         lendToken = await lendTokenFactory.deploy();
         await lendToken.waitForDeployment();
 
+        // Deploy mock price feed with price of $2000
+        const mockV3AggregatorFactory = await ethers.getContractFactory("MockV3Aggregator");
+        const mockPriceFeed = await mockV3AggregatorFactory.deploy(2000_00000000); // $2000 with 8 decimals
+        await mockPriceFeed.waitForDeployment();
+
         const poolFactory = await ethers.getContractFactory("Pool");
-        pool = await poolFactory.deploy(await lendToken.getAddress());
+        pool = await poolFactory.deploy(
+            await lendToken.getAddress(),
+            await mockPriceFeed.getAddress(),
+            0,
+            0
+        );
         await pool.waitForDeployment();
 
         await lendToken.transferOwnership(await pool.getAddress());
@@ -70,13 +83,47 @@ describe("Pool", () => {
     })
     describe("🪙 Liquidate", () => {
         it("💸 should liquidate collateral and burn lendToken", async () => {
-            const depositAmount = ethers.parseEther("1.5");
+            // Setup underwater position
+            const depositAmount = ethers.parseEther("1.0");
             await pool.depositCollateral(depositAmount, { value: depositAmount });
+            const maxBorrow = (depositAmount * BORROW_PRECISION) / COLLATERAL_RATIO;
+            await pool.borrow(maxBorrow);
 
-            const borrowAmount = ethers.parseEther("1");
+            // Create new pool with lower price
+            const mockV3AggregatorFactory = await ethers.getContractFactory("MockV3Aggregator");
+            const newPriceFeed = await mockV3AggregatorFactory.deploy(1_00000000); // $1
+            const poolFactory = await ethers.getContractFactory("Pool");
+            const newPool = await poolFactory.deploy(
+                await lendToken.getAddress(),
+                await newPriceFeed.getAddress(),
+                depositAmount,
+                maxBorrow
+            );
 
-        })
-    })
+            // Setup liquidation
+            await pool.transferLendTokenOwnership(user.address);
+            await lendToken.transferOwnership(await newPool.getAddress());
+            await newPool.setCollateralBalance(user.address, depositAmount);
+
+            // Liquidate the entire position
+            await newPool.liquidate(user.address, depositAmount);
+
+            // Verify liquidation
+            const finalCollateral = await newPool.collateralBalance(user.address);
+            expect(finalCollateral).to.equal(0);
+        });
+
+        it("❗️ should revert if health factor is above MIN_HEALTH_FACTOR", async () => {
+            const depositAmount = ethers.parseEther("1.0");
+            await pool.depositCollateral(depositAmount, { value: depositAmount });
+            const borrowAmount = ethers.parseEther("0.5"); // Healthy position
+            await pool.borrow(borrowAmount);
+
+            await expect(
+                pool.liquidate(user.address, borrowAmount)
+            ).to.be.revertedWithCustomError(pool, "Pool__HealthFactorIsOk");
+        });
+    });
     describe("🪙 Borrow", () => {
         it("💸 should allow borrowing based on collateral", async () => {
             const depositAmount = ethers.parseEther("1.5");

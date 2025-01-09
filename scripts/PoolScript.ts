@@ -36,6 +36,9 @@ async function main() {
     const utilization = Math.floor((Number(BORROW_AMOUNT) * 100) / Number(ETH_AMOUNT));
     const interest = await pool.calculateInterest(utilization);
     console.log(` 📈 Calculated interest rate for ${utilization}% utilization: ${interest}%`);
+
+    const healthFactor = await pool.healthFactor(deployer.address);
+    console.log(` ♥️ Health factor: ${healthFactor}`);
 }
 
 main()
